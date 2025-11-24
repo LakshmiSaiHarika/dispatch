@@ -45,6 +45,31 @@ impl Service {
             path,
         }
     }
+
+    /// Build a reqwest request for an asset, handling private/public repos and method.
+    fn build_request(
+        gh: &GitHub,
+        asset: &Asset,
+        client: &Client,
+        method: &Method,
+    ) -> reqwest::RequestBuilder {
+        let url = if gh.is_private() {
+            format!(
+                "https://api.github.com/repos/{}/{}/releases/assets/{}",
+                gh.owner(),
+                gh.repo(),
+                asset.id
+            )
+        } else {
+            asset.url.clone()
+        };
+
+        match method {
+            &Method::HEAD => client.head(url),
+            // Only HEAD and GET are expected; all others default to GET.
+            _ => client.get(url),
+        }
+    }
 }
 
 impl hyper::service::Service<Request<Incoming>> for Service {
@@ -110,7 +135,12 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                         None => return Ok(POWEROFF_EFI.reply(None, Type::Efi, EMPTY)),
 
                         // Send the request (possibly redirecting...)
-                        Some(asset) => (client.head(asset.url).send().await?, asset.mime),
+                        Some(asset) => {
+                            let request =
+                                Self::build_request(&github, &asset, &client, &Method::HEAD);
+
+                            (request.send().await?, asset.mime)
+                        }
                     }
                 }
 
@@ -122,7 +152,10 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
                         // Send the request (possibly redirecting...)
                         Some(asset) => {
-                            let response = client.get(asset.url).send().await?;
+                            let request =
+                                Self::build_request(&github, &asset, &client, &Method::GET);
+
+                            let response = request.send().await?;
                             status.lock().await.update().downloading(remote);
                             (response, asset.mime)
                         }
