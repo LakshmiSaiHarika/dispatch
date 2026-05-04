@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyper::server::conn::http1::Builder;
@@ -17,6 +18,9 @@ pub struct Server {
     github: Arc<GitHub>,
     client: Client,
     path: Arc<String>,
+    upload_dir: Arc<PathBuf>,
+    auto_extract: bool,
+    allow_anon_upload: bool,
 }
 
 impl Server {
@@ -28,6 +32,9 @@ impl Server {
         status: Arc<Mutex<Status>>,
         github: Arc<GitHub>,
         path: Arc<String>,
+        upload_dir: Arc<PathBuf>,
+        auto_extract: bool,
+        allow_anon_upload: bool,
     ) -> reqwest::Result<Self> {
         let policy = Policy::custom(move |attempt| {
             if attempt.previous().len() > Self::REDIRECTS {
@@ -79,6 +86,9 @@ impl Server {
             github,
             client: client_builder.build()?,
             path,
+            upload_dir,
+            auto_extract,
+            allow_anon_upload,
         })
     }
 
@@ -90,11 +100,14 @@ impl Server {
             let github = self.github.clone();
             let client = self.client.clone();
             let path = self.path.clone();
+            let upload_dir = self.upload_dir.clone();
+            let auto_extract = self.auto_extract;
+            let allow_anon_upload = self.allow_anon_upload;
 
             // Spawn a new task to handle the connection.
             tokio::spawn(async move {
                 let stream = TokioIo::new(stream);
-                let service = Service::new(addr.ip(), status, github, client, path);
+                let service = Service::new(addr.ip(), status, github, client, path, upload_dir, auto_extract, allow_anon_upload);
                 Builder::new().serve_connection(stream, service).await
             });
         }

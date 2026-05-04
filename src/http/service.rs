@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,10 @@ use hyper::{Method, StatusCode as Code};
 use hyper::{Request, Response};
 use reqwest::Client;
 use std::convert::Infallible;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use zip::ZipArchive;
 
 use crate::github::{Asset, GitHub, Report, Type};
 use crate::tui::Status;
@@ -27,15 +31,21 @@ pub struct Service {
     github: Arc<GitHub>,
     client: Client,
     path: Arc<String>,
+    upload_dir: Arc<PathBuf>,
+    auto_extract: bool,
+    allow_anon_upload: bool,
 }
 
 impl Service {
-    pub const fn new(
+    pub fn new(
         remote: IpAddr,
         status: Arc<Mutex<Status>>,
         github: Arc<GitHub>,
         client: Client,
         path: Arc<String>,
+        upload_dir: Arc<PathBuf>,
+        auto_extract: bool,
+        allow_anon_upload: bool,
     ) -> Self {
         Self {
             remote,
@@ -43,6 +53,9 @@ impl Service {
             github,
             client,
             path,
+            upload_dir,
+            auto_extract,
+            allow_anon_upload,
         }
     }
 
@@ -83,6 +96,9 @@ impl hyper::service::Service<Request<Incoming>> for Service {
         let github = self.github.clone();
         let path = self.path.clone();
         let remote = self.remote;
+        let upload_dir = self.upload_dir.clone();
+        let auto_extract = self.auto_extract;
+        let allow_anon_upload = self.allow_anon_upload;
 
         Box::pin(async move {
             if req.uri().path() != *path {
@@ -128,6 +144,67 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     return Ok(EMPTY.reply(None, None, None));
                 }
 
+                // The PATCH request is used to upload files.
+                Method::PATCH => {
+                    // Verify the client has an active job (unless anonymous uploads are allowed)
+                    if !allow_anon_upload && !status.lock().await.update().is_active(remote) {
+                        return Ok(EMPTY.reply(Code::EXPECTATION_FAILED, None, None));
+                    }
+
+                    // Get archive name from header or generate default
+                    let archive_name = req
+                        .headers()
+                        .get("x-archive-name")
+                        .and_then(|v| v.to_str().ok())
+                        .map(sanitize_filename)
+                        .unwrap_or_else(|| {
+                            format!("upload-{}-{}.zip", remote, chrono_timestamp())
+                        });
+
+                    // Collect the request body
+                    let bytes = req.into_body().collect().await?.to_bytes();
+                    if bytes.is_empty() {
+                        return Ok(EMPTY.reply(Code::BAD_REQUEST, None, None));
+                    }
+
+                    // Create subdirectory for this remote IP
+                    let remote_dir = upload_dir.join(remote.to_string());
+                    if let Err(e) = tokio::fs::create_dir_all(&remote_dir).await {
+                        eprintln!("Failed to create upload directory: {e}");
+                        return Ok(EMPTY.reply(Code::INTERNAL_SERVER_ERROR, None, None));
+                    }
+
+                    // Write the file
+                    let file_path = remote_dir.join(&archive_name);
+                    match File::create(&file_path).await {
+                        Ok(mut file) => {
+                            if let Err(e) = file.write_all(&bytes).await {
+                                eprintln!("Failed to write upload: {e}");
+                                return Ok(EMPTY.reply(Code::INTERNAL_SERVER_ERROR, None, None));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create upload file: {e}");
+                            return Ok(EMPTY.reply(Code::INTERNAL_SERVER_ERROR, None, None));
+                        }
+                    }
+
+                    // Auto-extract if enabled
+                    if auto_extract {
+                        let extract_dir = remote_dir.join(
+                            archive_name
+                                .strip_suffix(".zip")
+                                .unwrap_or(&archive_name)
+                        );
+                        if let Err(e) = extract_zip(&file_path, &extract_dir).await {
+                            eprintln!("Failed to extract upload: {e}");
+                            // Don't fail the request, just log the error
+                        }
+                    }
+
+                    return Ok(EMPTY.reply(Code::CREATED, None, None));
+                }
+
                 // The HEAD request is used to get information about the assigned asset.
                 Method::HEAD => {
                     match status.clone().assign(remote).await {
@@ -166,7 +243,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                 _ => {
                     return Ok(Response::builder()
                         .status(Code::METHOD_NOT_ALLOWED)
-                        .header("allow", "GET, POST, HEAD, PUT")
+                        .header("allow", "GET, POST, HEAD, PUT, PATCH")
                         .body(EMPTY.embody())?)
                 }
             };
@@ -246,4 +323,68 @@ impl Assign for Arc<Mutex<Status>> {
     async fn assign(self, ip: IpAddr) -> Option<Asset> {
         self.lock().await.update().assign(ip)
     }
+}
+
+/// Sanitizes a filename to prevent path traversal attacks.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect::<String>()
+        .trim_start_matches('.')
+        .to_string()
+}
+
+/// Generates a timestamp string for default filenames.
+fn chrono_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Extracts a ZIP archive to a specified directory.
+async fn extract_zip(zip_path: &Path, extract_to: &Path) -> Result<(), String> {
+    let zip_path = zip_path.to_path_buf();
+    let extract_to = extract_to.to_path_buf();
+
+    // Run extraction in a blocking task since zip crate is not async
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let file = std::fs::File::open(&zip_path)
+            .map_err(|e| format!("Failed to open zip: {e}"))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|e| format!("Failed to read zip archive: {e}"))?;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)
+                .map_err(|e| format!("Failed to read zip entry {i}: {e}"))?;
+            let outpath = extract_to.join(file.name());
+
+            // Prevent path traversal attacks
+            if !outpath.starts_with(&extract_to) {
+                eprintln!("Warning: Skipping file with invalid path: {}", file.name());
+                continue;
+            }
+
+            if file.is_dir() {
+                std::fs::create_dir_all(&outpath)
+                    .map_err(|e| format!("Failed to create directory: {e}"))?;
+            } else {
+                if let Some(p) = outpath.parent() {
+                    std::fs::create_dir_all(p)
+                        .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {e}"))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to write file: {e}"))?;
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+
+    Ok(())
 }
