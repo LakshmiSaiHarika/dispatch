@@ -166,4 +166,18 @@ impl Jobs {
 
         false
     }
+
+    /// Checks if the given IP has an active job (not finished or failed).
+    pub fn is_active(&self, ip: IpAddr) -> bool {
+        self.0.iter().any(|job| {
+            matches!(
+                job.state,
+                State::Assigned(addr)
+                    | State::Downloading(addr)
+                    | State::Booting(addr)
+                    | State::Reported(addr)
+                if addr == ip
+            )
+        })
+    }
 }
