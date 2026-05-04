@@ -24,6 +24,7 @@ http-body-util = { version = "0.1", default-features = false }
 serde_json = { version = "1.0", default-features = false }
 anyhow = { version = "1.0", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 uefi-reset = { version = "1.0", artifact = "bin", target = "x86_64-unknown-uefi" }
