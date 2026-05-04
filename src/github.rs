@@ -81,6 +81,7 @@ impl Asset<Knowable<Type, String>> {
 
 #[derive(Debug, Deserialize)]
 struct Release {
+    #[serde(default)]
     assets: Vec<Asset<Knowable<Type, String>>>,
 }
 
