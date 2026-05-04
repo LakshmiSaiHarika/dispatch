@@ -44,6 +44,18 @@ struct Args {
     /// Path to offer services on
     #[arg(short = 'p', long, default_value = concat!("/", std::env!("CARGO_PKG_NAME")))]
     path: String,
+
+    /// Directory to store uploaded files
+    #[arg(short = 'u', long, default_value = "./uploads")]
+    upload_dir: std::path::PathBuf,
+
+    /// Auto-extract uploaded ZIP files
+    #[arg(short = 'x', long, default_value = "false")]
+    auto_extract: bool,
+
+    /// Allow anonymous uploads (without requiring an active job)
+    #[arg(long, default_value = "false")]
+    allow_anon_upload: bool,
 }
 
 /// Guard that ensures term settings are restored upon program exit
@@ -82,8 +94,14 @@ async fn main() -> Result<()> {
     let status = Arc::new(Mutex::new(Status::new(assets, addr, path.clone())));
     status.lock().await.render()?;
 
+    // Ensure upload directory exists
+    tokio::fs::create_dir_all(&args.upload_dir).await?;
+    let upload_dir = Arc::new(args.upload_dir);
+    let auto_extract = args.auto_extract;
+    let allow_anon_upload = args.allow_anon_upload;
+
     // Create the HTTP server
-    let server = Server::new(listener, status.clone(), github, path.clone())?;
+    let server = Server::new(listener, status.clone(), github, path.clone(), upload_dir, auto_extract, allow_anon_upload)?;
 
     // Create TXT records
     let name = std::env!("CARGO_PKG_NAME");
