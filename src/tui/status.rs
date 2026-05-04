@@ -93,6 +93,13 @@ impl DerefMut for Update<'_> {
     }
 }
 
+impl Update<'_> {
+    /// Checks if the given IP has an active job.
+    pub fn is_active(&self, ip: IpAddr) -> bool {
+        self.0.jobs.is_active(ip)
+    }
+}
+
 impl Drop for Update<'_> {
     fn drop(&mut self) {
         let _ = self.0.render();
